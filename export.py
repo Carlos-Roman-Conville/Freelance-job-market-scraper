@@ -39,7 +39,12 @@ def _write_rows(ws, rows, field_keys, link_columns=None):
             elif value is None:
                 value = ""
 
-            cell = ws.cell(row=row_idx, column=col_idx, value=str(value) if value else "")
+            if isinstance(value, str) and value and value[0] in ('=', '+', '-', '@', '\t', '\r'):
+                value = "'" + value
+            if isinstance(value, str) and value == "":
+                cell = ws.cell(row=row_idx, column=col_idx, value="")
+            else:
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.font = data_font
             cell.border = thin_border
             if bg:
@@ -58,7 +63,8 @@ def export_upwork_excel(jobs, filename=None):
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"Upwork_Jobs_{timestamp}.xlsx"
 
-    # Parse skills JSON strings back to lists for display
+    # Parse skills JSON strings to lists for display (on copies to avoid mutating input)
+    jobs = [dict(job) for job in jobs]
     for job in jobs:
         if isinstance(job.get("skills"), str):
             try:
@@ -109,7 +115,7 @@ def export_upwork_excel(jobs, filename=None):
     total = len(jobs)
     fixed = sum(1 for j in jobs if "fixed" in str(j.get("budget_type", "")).lower())
     hourly = sum(1 for j in jobs if "hourly" in str(j.get("budget_type", "")).lower())
-    budgets = [j["budget_min"] for j in jobs if j.get("budget_min")]
+    budgets = [j["budget_min"] for j in jobs if j.get("budget_min") is not None]
     avg_budget = f"${sum(budgets) / len(budgets):,.0f}" if budgets else "N/A"
 
     cats = {}
@@ -126,13 +132,18 @@ def export_upwork_excel(jobs, filename=None):
         hcell.fill = stats_fill
         hcell.font = stats_font
         hcell.alignment = Alignment(horizontal="center")
-        vcell = ws_stats.cell(row=2, column=col, value=str(val))
+        vcell = ws_stats.cell(row=2, column=col, value=val)
         vcell.font = val_font
         vcell.alignment = Alignment(horizontal="center")
         ws_stats.column_dimensions[get_column_letter(col)].width = 22
 
     filepath = OUTPUT_DIR / filename
-    wb.save(filepath)
+    try:
+        wb.save(filepath)
+    except (PermissionError, OSError) as e:
+        print(f"\nERROR: Cannot save {filepath}: {e}")
+        print("Close the file if it's open in another program and try again.")
+        return None
     print(f"\nExported {total} Upwork jobs to {filepath}")
     return filepath
 
@@ -146,6 +157,7 @@ def export_fiverr_excel(gigs, filename=None):
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"Fiverr_Gigs_{timestamp}.xlsx"
 
+    gigs = [dict(gig) for gig in gigs]
     for gig in gigs:
         if isinstance(gig.get("tags"), str):
             try:
@@ -188,12 +200,12 @@ def export_fiverr_excel(gigs, filename=None):
 
     labels = ["Total Gigs", "Avg Price", "Avg Rating", "Top Rated", "With Reviews"]
     total = len(gigs)
-    prices = [g["price_min"] for g in gigs if g.get("price_min")]
+    prices = [g["price_min"] for g in gigs if g.get("price_min") is not None]
     avg_price = f"${sum(prices) / len(prices):,.0f}" if prices else "N/A"
-    ratings = [g["rating"] for g in gigs if g.get("rating")]
+    ratings = [g["rating"] for g in gigs if g.get("rating") is not None]
     avg_rating = f"{sum(ratings) / len(ratings):.1f}" if ratings else "N/A"
     top_rated = sum(1 for g in gigs if "top" in str(g.get("seller_level", "")).lower())
-    with_reviews = sum(1 for g in gigs if g.get("num_reviews"))
+    with_reviews = sum(1 for g in gigs if g.get("num_reviews") is not None and g["num_reviews"] > 0)
 
     values = [total, avg_price, avg_rating, top_rated, with_reviews]
 
@@ -202,12 +214,17 @@ def export_fiverr_excel(gigs, filename=None):
         hcell.fill = stats_fill
         hcell.font = stats_font
         hcell.alignment = Alignment(horizontal="center")
-        vcell = ws_stats.cell(row=2, column=col, value=str(val))
+        vcell = ws_stats.cell(row=2, column=col, value=val)
         vcell.font = val_font
         vcell.alignment = Alignment(horizontal="center")
         ws_stats.column_dimensions[get_column_letter(col)].width = 22
 
     filepath = OUTPUT_DIR / filename
-    wb.save(filepath)
+    try:
+        wb.save(filepath)
+    except (PermissionError, OSError) as e:
+        print(f"\nERROR: Cannot save {filepath}: {e}")
+        print("Close the file if it's open in another program and try again.")
+        return None
     print(f"\nExported {total} Fiverr gigs to {filepath}")
     return filepath

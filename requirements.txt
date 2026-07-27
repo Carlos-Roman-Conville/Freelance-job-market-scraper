@@ -1,3 +1,6 @@
 nodriver
 openpyxl
 python-dotenv
+anthropic
+chromadb
+flask

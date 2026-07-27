@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import re
 from pathlib import Path
 
 import nodriver as uc
@@ -15,11 +16,12 @@ CHROME_PROFILE = Path(os.environ.get(
 
 
 class BaseScraper:
-    def __init__(self, db, use_chrome=False):
+    def __init__(self, db, use_chrome=False, headless=False):
         self.db = db
         self.browser = None
         self.page = None
         self.use_chrome = use_chrome
+        self.headless = headless
 
     async def start_browser(self):
         if self.use_chrome:
@@ -31,16 +33,22 @@ class BaseScraper:
             profile.mkdir(parents=True, exist_ok=True)
 
         self.browser = await uc.start(
-            headless=False,
+            headless=self.headless,
             user_data_dir=str(profile),
+            sandbox=False,
         )
 
     async def stop_browser(self):
         if self.browser:
-            self.browser.stop()
+            browser = self.browser
+            self.browser = None
+            self.page = None
+            browser.stop()
 
     def _is_blocked(self, content):
         lower = content.lower()
+        if self._is_404(lower):
+            return False
         return (
             len(content) < CAPTCHA_THRESHOLD
             or "just a moment" in lower[:2000]
@@ -48,7 +56,27 @@ class BaseScraper:
             or "captcha" in lower[:3000]
         )
 
+    def _is_404(self, lower_content):
+        indicators = [
+            "page not found", "page isn't available", "gig not found",
+            "this page is no longer available", "doesn't exist",
+            "has been removed", "no longer available",
+        ]
+        head = lower_content[:3000]
+        if any(ind in head for ind in indicators):
+            return True
+        if re.search(r'\b404\b.*(?:error|not found|page)', head):
+            return True
+        if '<title' in head and '404' in head.split('</title')[0] and 'not found' in head.split('</title')[0]:
+            return True
+        return False
+
     async def navigate(self, url, wait=8, max_retries=4):
+        if self.page is not None:
+            try:
+                await self.page.close()
+            except Exception:
+                pass
         self.page = await self.browser.get(url)
         await self.page.sleep(wait)
         content = await self.page.get_content()

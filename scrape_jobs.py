@@ -1,29 +1,32 @@
 """
-Job Market Scraper — Scrapes Upwork and Fiverr job listings using nodriver.
-Stores data in SQLite for later RAG analysis with Claude API.
+Job Market Scraper — Scrapes Upwork (GraphQL API) and Fiverr (nodriver) job listings.
+Stores data in PostgreSQL for later RAG analysis with Claude API.
 
 Usage:
-    python scrape_jobs.py upwork --search "web scraping" --pages 3 --chrome
+    python scrape_jobs.py upwork --search "web scraping" --pages 3
     python scrape_jobs.py fiverr --search "data entry" --pages 2
     python scrape_jobs.py export upwork --query "web scraping"
     python scrape_jobs.py export fiverr
     python scrape_jobs.py stats
 
-Note: Close Chrome before using --chrome flag (can't share profile with running Chrome).
+Note: Close Chrome before using --chrome flag for Fiverr (can't share profile with running Chrome).
 """
 import argparse
 import asyncio
 import sys
 
-from config import DB_PATH, DEFAULT_PAGES
+from config import DATABASE_URL, DEFAULT_PAGES
 from db import JobDatabase
 from export import export_upwork_excel, export_fiverr_excel
 
 
 def cmd_upwork(args, db):
     from scrapers.upwork import UpworkScraper
-    scraper = UpworkScraper(db, use_chrome=args.chrome)
-    count = asyncio.run(scraper.scrape(args.search, args.pages))
+    scraper = UpworkScraper(db)
+    try:
+        count = scraper.scrape(args.search, args.pages)
+    finally:
+        scraper.close()
     print(f"\n{'=' * 50}")
     print(f"  Scraped {count} Upwork jobs for '{args.search}'")
     print(f"{'=' * 50}")
@@ -84,12 +87,11 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # Upwork scraper
+    # Upwork scraper (uses GraphQL API, no browser needed)
     up = subparsers.add_parser("upwork", help="Scrape Upwork job listings")
     up.add_argument("--search", required=True, help="Search query")
     up.add_argument("--pages", type=int, default=DEFAULT_PAGES, help=f"Pages to scrape (default: {DEFAULT_PAGES})")
     up.add_argument("--export", action="store_true", help="Export results to Excel after scraping")
-    up.add_argument("--chrome", action="store_true", help="Use your real Chrome profile (close Chrome first!)")
 
     # Fiverr scraper
     fv = subparsers.add_parser("fiverr", help="Scrape Fiverr gig listings")
@@ -112,7 +114,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    db = JobDatabase(DB_PATH)
+    db = JobDatabase(DATABASE_URL)
 
     try:
         if args.command == "upwork":

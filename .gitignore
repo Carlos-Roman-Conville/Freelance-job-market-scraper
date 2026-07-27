@@ -5,4 +5,10 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/browser_profile/
+data/chroma/
+data/debug_page.html
 output/
+BUG_LOG.md
+.env.example
+.claude/
+migrate_to_postgres.py

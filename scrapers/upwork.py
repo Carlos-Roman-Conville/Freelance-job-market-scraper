@@ -1,343 +1,314 @@
+"""
+Upwork job scraper using Upwork's internal GraphQL API + curl_cffi.
+
+Uses TLS fingerprint impersonation (curl_cffi) to bypass Cloudflare,
+fetches a visitor_gql_token from the homepage, then queries the
+GraphQL endpoint for job listings. No browser needed.
+"""
+
 import json
+import random
 import re
-from urllib.parse import urlencode
+import time
 
-from scrapers.base import BaseScraper
-from config import CAPTCHA_THRESHOLD
+from curl_cffi import requests as cffi_requests
+
+from config import DELAY_MIN, DELAY_MAX
+
+GRAPHQL_URL = "https://www.upwork.com/api/graphql/v1"
+TOKEN_COOKIE = "visitor_gql_token"
+PAGE_SIZE = 50
+
+JOB_SEARCH_QUERY = """
+query VisitorJobSearch($requestVariables: VisitorJobSearchV1Request!) {
+  search {
+    universalSearchNuxt {
+      visitorJobSearchV1(request: $requestVariables) {
+        paging {
+          total
+          offset
+          count
+        }
+        results {
+          id
+          title
+          description
+          ontologySkills {
+            prefLabel
+          }
+          jobTile {
+            job {
+              id
+              ciphertext: cipherText
+              jobType
+              hourlyBudgetMax
+              hourlyBudgetMin
+              contractorTier
+              publishTime
+              hourlyEngagementDuration {
+                weeks
+              }
+              fixedPriceAmount {
+                amount
+              }
+              fixedPriceEngagementDuration {
+                weeks
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
 
 
-def _safe(pattern, content, group=1, default=""):
-    match = re.search(pattern, content, re.DOTALL)
-    return match.group(group).strip() if match else default
+def _clean_highlight(text):
+    """Remove H^...^H highlight markers from search results."""
+    return re.sub(r'H\^(.*?)\^H', r'\1', text)
 
 
-def _clean_html(text):
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'&amp;', '&', text)
-    text = re.sub(r'&lt;', '<', text)
-    text = re.sub(r'&gt;', '>', text)
-    text = re.sub(r'&#\d+;', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+class UpworkScraper:
+    """Scrape Upwork jobs via GraphQL API with curl_cffi TLS impersonation."""
 
+    def __init__(self, db):
+        self.db = db
+        self._token = None
+        self._session = None
 
-class UpworkScraper(BaseScraper):
-    SEARCH_URL = "https://www.upwork.com/nx/search/jobs/"
+    def _get_session(self):
+        if self._session is None:
+            self._session = cffi_requests.Session(impersonate="chrome")
+        return self._session
 
-    def build_search_url(self, query, page):
-        params = urlencode({"q": query, "page": str(page), "per_page": "10"})
-        return f"{self.SEARCH_URL}?{params}"
+    def _fetch_token(self):
+        """Fetch visitor_gql_token from Upwork homepage cookies."""
+        print("  Fetching visitor token from upwork.com...")
+        session = self._get_session()
+        resp = session.get("https://www.upwork.com/", timeout=30)
+        resp.raise_for_status()
 
-    def _extract_job_urls_from_search(self, content):
-        """Pull job URLs and basic card data from the search results page."""
-        cards = []
+        token = resp.cookies.get(TOKEN_COOKIE)
+        if not token:
+            available = list(resp.cookies.keys())
+            raise RuntimeError(
+                f"No {TOKEN_COOKIE} cookie found. Available: {available}"
+            )
 
-        tile_keys = [k for k in re.findall(r'data-test-key="(\d+)"', content) if len(k) > 10]
-        if not tile_keys:
-            return cards
+        self._token = token
+        print(f"  Token acquired ({len(token)} chars)")
+        return token
 
-        for key in tile_keys:
-            start_pos = content.find(f'data-test-key="{key}"')
-            if start_pos < 0:
-                continue
+    def _graphql_headers(self):
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._token}",
+        }
 
-            next_pos = len(content)
-            for other_key in tile_keys:
-                if other_key != key:
-                    other_pos = content.find(f'data-test-key="{other_key}"', start_pos + 100)
-                    if 0 < other_pos < next_pos:
-                        next_pos = other_pos
+    def _search_page(self, query, offset=0):
+        """Fetch one page of job search results via GraphQL."""
+        variables = {
+            "requestVariables": {
+                "userQuery": query,
+                "sort": "recency",
+                "highlight": True,
+                "paging": {
+                    "offset": offset,
+                    "count": PAGE_SIZE,
+                },
+            }
+        }
 
-            block = content[start_pos:next_pos]
+        session = self._get_session()
+        resp = session.post(
+            GRAPHQL_URL,
+            json={"query": JOB_SEARCH_QUERY, "variables": variables},
+            headers=self._graphql_headers(),
+            timeout=30,
+        )
 
-            url_match = re.search(r'href="(/jobs/[^"?]+)', block)
-            job_url = f"https://www.upwork.com{url_match.group(1)}" if url_match else ""
+        if resp.status_code == 401:
+            raise TokenExpired("Token expired, need to refresh")
+        resp.raise_for_status()
 
-            title_match = re.search(r'data-test="job-tile-title-link[^"]*"[^>]*>(.*?)</a>', block, re.DOTALL)
-            title = _clean_html(title_match.group(1)) if title_match else ""
+        data = resp.json()
 
-            if not title or not job_url:
-                continue
+        if "errors" in data:
+            raise RuntimeError(f"GraphQL errors: {data['errors']}")
 
-            # Grab what we can from the card as a starting point
-            posted_match = re.search(r'data-test="job-pubilshed-date"[^>]*>.*?<span>([^<]+)', block, re.DOTALL)
-            posted_date = posted_match.group(1).strip() if posted_match else ""
+        search_result = (
+            (data.get("data") or {})
+            .get("search") or {}
+        )
+        search_result = (
+            (search_result.get("universalSearchNuxt") or {})
+            .get("visitorJobSearchV1") or {}
+        )
 
-            type_match = re.search(r'data-test="job-type-label"[^>]*>.*?<strong>([^<]+)', block, re.DOTALL)
-            type_text = _clean_html(type_match.group(1)) if type_match else ""
+        paging = search_result.get("paging", {})
+        results = search_result.get("results", [])
 
-            budget_type = ""
+        return paging, results
+
+    def _parse_job(self, result, search_query):
+        """Parse a single GraphQL job result into our database format."""
+        title = _clean_highlight(result.get("title") or "")
+        description = _clean_highlight(result.get("description") or "")
+
+        # Skills from ontologySkills
+        skills = []
+        for s in (result.get("ontologySkills") or []):
+            label = s.get("prefLabel", "")
+            if label:
+                skills.append(label)
+
+        # Job details from nested jobTile.job
+        tile = result.get("jobTile", {}) or {}
+        job = tile.get("job", {}) or {}
+
+        # Budget
+        job_type_raw = job.get("jobType", "")
+        hourly_min = job.get("hourlyBudgetMin")
+        hourly_max = job.get("hourlyBudgetMax")
+        fixed_raw = job.get("fixedPriceAmount")
+
+        if hourly_min is not None or hourly_max is not None:
+            budget_type = "Hourly"
+            budget_min = float(hourly_min) if hourly_min is not None else None
+            budget_max = float(hourly_max) if hourly_max is not None else None
+        elif fixed_raw and fixed_raw.get("amount") is not None:
+            budget_type = "Fixed"
+            budget_min = float(fixed_raw["amount"])
+            budget_max = None
+        else:
+            budget_type = job_type_raw.title() if job_type_raw else ""
             budget_min = None
             budget_max = None
-            if "hourly" in type_text.lower():
-                budget_type = "Hourly"
-                amounts = re.findall(r'\$([\d,.]+)', type_text)
-                if len(amounts) >= 2:
-                    budget_min = float(amounts[0].replace(",", ""))
-                    budget_max = float(amounts[1].replace(",", ""))
-                elif len(amounts) == 1:
-                    budget_min = float(amounts[0].replace(",", ""))
-            elif "fixed" in type_text.lower() or re.search(r'\$[\d,]+', type_text):
-                budget_type = "Fixed"
-                amounts = re.findall(r'\$([\d,.]+)', type_text)
-                if amounts:
-                    budget_min = float(amounts[0].replace(",", ""))
 
-            if not budget_type:
-                fixed_match = re.search(r'data-test="is-fixed-price"[^>]*>.*?<strong>([^<]+)', block, re.DOTALL)
-                if fixed_match:
-                    budget_type = "Fixed"
-                    amounts = re.findall(r'\$([\d,.]+)', fixed_match.group(1))
-                    if amounts:
-                        budget_min = float(amounts[0].replace(",", ""))
+        # Experience level
+        tier = job.get("contractorTier", "")
+        tier_map = {
+            "EntryLevel": "Entry",
+            "IntermediateLevel": "Intermediate",
+            "ExpertLevel": "Expert",
+        }
+        experience_level = tier_map.get(tier, tier)
 
-            exp_match = re.search(r'data-test="experience-level"[^>]*>.*?<strong>([^<]+)', block, re.DOTALL)
-            experience = _clean_html(exp_match.group(1)) if exp_match else ""
+        # Job URL from ciphertext
+        cipher = job.get("ciphertext", "")
+        job_url = f"https://www.upwork.com/jobs/{cipher}" if cipher else ""
 
-            skills = []
-            skill_matches = re.findall(r'data-test="token"[^>]*>.*?<span[^>]*>([^<]+)', block, re.DOTALL)
-            skills = [_clean_html(s) for s in skill_matches if len(s.strip()) > 1]
+        # Posted date
+        posted_date = job.get("publishTime", "")
 
-            cards.append({
-                "job_url": job_url,
-                "title": title,
-                "skills": skills,
-                "budget_type": budget_type,
-                "budget_min": budget_min,
-                "budget_max": budget_max,
-                "experience_level": experience,
-                "posted_date": posted_date,
-            })
-
-        return cards
-
-    def _parse_job_detail(self, content, card_data):
-        """Parse a full job detail page. Merges with card_data from search results."""
-        data = {
-            "job_url": card_data.get("job_url", ""),
-            "title": card_data.get("title", ""),
-            "description": "",
-            "skills": card_data.get("skills", []),
-            "budget_type": card_data.get("budget_type", ""),
-            "budget_min": card_data.get("budget_min"),
-            "budget_max": card_data.get("budget_max"),
-            "experience_level": card_data.get("experience_level", ""),
+        return {
+            "job_url": job_url,
+            "title": title,
+            "description": description[:10000],
+            "skills": skills,
+            "budget_type": budget_type,
+            "budget_min": budget_min,
+            "budget_max": budget_max,
+            "experience_level": experience_level,
             "client_rating": None,
             "client_total_spent": "",
             "client_hire_rate": "",
             "client_country": "",
             "num_proposals": None,
-            "posted_date": card_data.get("posted_date", ""),
+            "posted_date": posted_date,
             "category": "",
+            "search_query": search_query,
         }
 
-        # --- Full description ---
-        # Try multiple selectors for the job description section
-        for desc_pattern in [
-            r'data-test="Description"[^>]*>(.*?)(?=</section|<section|<div[^>]*data-test="(?:Skills|Activity|About)',
-            r'class="[^"]*job-description[^"]*"[^>]*>(.*?)(?=</section|<section)',
-            r'class="[^"]*description[^"]*"[^>]*>(.*?)(?=</div>\s*</div>\s*<(?:section|div[^>]*data-test))',
-            r'<div[^>]*data-test="PostedBy"[^>]*>.*?</div>\s*(.*?)(?=<section|<div[^>]*(?:data-test="Skills|class="sidebar"))',
-        ]:
-            desc_match = re.search(desc_pattern, content, re.DOTALL | re.I)
-            if desc_match:
-                raw = desc_match.group(1)
-                cleaned = _clean_html(raw)
-                if len(cleaned) > 50:
-                    data["description"] = cleaned[:10000]
-                    break
+    def scrape(self, search_query, pages=3, delay_range=None, stop_on_dupes=False):
+        """Scrape Upwork jobs for a search query. Returns count of new jobs stored.
 
-        # If still no description, grab the biggest text block on the page
-        if not data["description"]:
-            text_blocks = re.findall(r'<(?:p|div)[^>]*>(.*?)</(?:p|div)>', content, re.DOTALL)
-            longest = ""
-            for block in text_blocks:
-                cleaned = _clean_html(block)
-                if len(cleaned) > len(longest) and len(cleaned) > 100:
-                    longest = cleaned
-            if longest:
-                data["description"] = longest[:10000]
-
-        # --- Title from detail page (more reliable than card) ---
-        title_match = re.search(r'<h1[^>]*>(.*?)</h1>', content, re.DOTALL)
-        if title_match:
-            detail_title = _clean_html(title_match.group(1))
-            if detail_title:
-                data["title"] = detail_title
-
-        # --- Skills from detail page (may have more than card) ---
-        detail_skills = []
-        skills_section = re.search(r'data-test="Skills"(.*?)(?=</section|<section)', content, re.DOTALL | re.I)
-        if not skills_section:
-            skills_section = re.search(r'class="[^"]*skills[^"]*"(.*?)(?=</section|</div>\s*</div>\s*<section)', content, re.DOTALL | re.I)
-        if skills_section:
-            skill_items = re.findall(r'>([^<]{2,30})<', skills_section.group(1))
-            detail_skills = [_clean_html(s) for s in skill_items
-                           if len(s.strip()) > 1
-                           and s.strip().lower() not in ("skills", "skills and expertise", "other skills")]
-        if detail_skills:
-            data["skills"] = detail_skills
-
-        # --- Client info ---
-        # Look for the client/about section
-        client_section = re.search(
-            r'(?:data-test="(?:AboutClient|ClientInfo|client-info)"|class="[^"]*client[^"]*sidebar[^"]*"|About the client)(.*?)(?=</section|<section|$)',
-            content, re.DOTALL | re.I
-        )
-        client_block = client_section.group(1) if client_section else content
-
-        # Payment verified
-        # Rating
-        rating_match = re.search(r'([\d.]+)\s*(?:of 5|stars?|★)', client_block, re.I)
-        if not rating_match:
-            rating_match = re.search(r'(?:Rating|rating)[^>]*>.*?([\d.]+)', client_block, re.DOTALL)
-        if rating_match:
-            try:
-                data["client_rating"] = float(rating_match.group(1))
-            except ValueError:
-                pass
-
-        # Total spent
-        spent_match = re.search(r'\$([\d,.]+[KkMm]?)\s*(?:total\s*)?spent', client_block, re.I)
-        if not spent_match:
-            spent_match = re.search(r'(?:spent|Total spent)[^>]*>\s*\$?([\d,.]+[KkMm]?)', client_block, re.DOTALL | re.I)
-        if spent_match:
-            data["client_total_spent"] = spent_match.group(1).strip()
-
-        # Hire rate
-        hire_match = re.search(r'(\d+)%?\s*(?:hire\s*rate)', client_block, re.I)
-        if hire_match:
-            data["client_hire_rate"] = f"{hire_match.group(1)}%"
-
-        # Country
-        country_match = re.search(r'(?:Member since|Location)[^>]*>.*?<[^>]*>([A-Z][a-zA-Z\s]{2,25})<', client_block, re.DOTALL)
-        if not country_match:
-            country_match = re.search(r'data-test="(?:client-location|ClientLocation)"[^>]*>([^<]+)', client_block)
-        if country_match:
-            data["client_country"] = country_match.group(1).strip()
-
-        # --- Proposals ---
-        proposals_match = re.search(r'(\d+)\s+(?:to\s+\d+\s+)?proposals?', content, re.I)
-        if not proposals_match:
-            proposals_match = re.search(r'(?:Proposals|proposals)[^>]*>\s*(\d+)', content, re.DOTALL)
-        if proposals_match:
-            try:
-                data["num_proposals"] = int(proposals_match.group(1))
-            except ValueError:
-                pass
-
-        # --- Category ---
-        cat_match = re.search(r'(?:data-test="Category"|class="[^"]*category[^"]*")[^>]*>([^<]+)', content, re.I)
-        if not cat_match:
-            # Try breadcrumb
-            cat_match = re.search(r'<a[^>]*href="/cat/[^"]*"[^>]*>([^<]+)', content)
-        if cat_match:
-            data["category"] = _clean_html(cat_match.group(1))
-
-        # --- Budget from detail page (override card if found) ---
-        if not data["budget_type"]:
-            if re.search(r'Fixed.price|Fixed-Price', content, re.I):
-                data["budget_type"] = "Fixed"
-            elif re.search(r'Hourly', content, re.I):
-                data["budget_type"] = "Hourly"
-
-        if not data["budget_min"]:
-            budget_match = re.search(r'\$\s*([\d,]+(?:\.\d+)?)\s*(?:-\s*\$\s*([\d,]+(?:\.\d+)?))?', content)
-            if budget_match:
-                data["budget_min"] = float(budget_match.group(1).replace(",", ""))
-                if budget_match.group(2):
-                    data["budget_max"] = float(budget_match.group(2).replace(",", ""))
-
-        # --- Posted date from detail ---
-        if not data["posted_date"]:
-            posted = _safe(r'(?:Posted|posted)\s+([\w\s]+ago)', content)
-            if posted:
-                data["posted_date"] = posted
-
-        return data
-
-    async def scrape(self, search_query, pages):
+        Args:
+            delay_range: tuple (min, max) seconds between pages. Defaults to config values.
+            stop_on_dupes: if True, stop a query when a page is >80% duplicates.
+        """
+        d_min, d_max = delay_range or (DELAY_MIN, DELAY_MAX)
         run_id = self.db.start_run("upwork", search_query)
-        await self.start_browser()
         total = 0
 
+        pages_done = 0
         try:
-            print("Navigating to Upwork homepage...")
-            content = await self.navigate("https://www.upwork.com", wait=10)
-            if self._is_blocked(content):
-                print("\n  Cloudflare is blocking access.")
-                print("  Try running with --chrome flag to use your logged-in Chrome profile.")
-                print("  (Close Chrome first, then run:)")
-                print(f"  python scrape_jobs.py upwork --search \"{search_query}\" --chrome\n")
+            self._fetch_token()
 
             for page_num in range(1, pages + 1):
-                url = self.build_search_url(search_query, page_num)
-                print(f"\n[Page {page_num}/{pages}] {url}")
-                content = await self.navigate(url)
+                offset = (page_num - 1) * PAGE_SIZE
+                print(f"\n[Page {page_num}/{pages}] offset={offset}")
 
-                print(f"  Content length: {len(content)} bytes")
+                try:
+                    paging, results = self._search_page(search_query, offset)
+                except TokenExpired:
+                    print("  Token expired, refreshing...")
+                    self._fetch_token()
+                    paging, results = self._search_page(search_query, offset)
 
-                if self._is_blocked(content):
-                    print("  Page is blocked by Cloudflare. Stopping.")
+                api_total = paging.get("total", 0)
+                print(f"  Got {len(results)} results (API reports {api_total} total)")
+
+                if not results:
+                    print("  No results on this page, stopping.")
                     break
 
-                # Phase 1: Get job URLs and card data from search results
-                cards = self._extract_job_urls_from_search(content)
-                print(f"  Found {len(cards)} jobs, visiting each for full details...")
-
-                # Phase 2: Visit each job page for full description + client info
-                for i, card in enumerate(cards):
-                    job_url = card["job_url"]
-                    print(f"  [{i+1}/{len(cards)}] {card['title'][:55]}")
-
-                    await self.random_delay()
-
+                page_new = 0
+                for i, result in enumerate(results):
                     try:
-                        detail_content = await self.navigate(job_url)
-
-                        if self._is_blocked(detail_content):
-                            print(f"    BLOCKED — using card data only")
-                            card["description"] = ""
-                            card["client_rating"] = None
-                            card["client_total_spent"] = ""
-                            card["client_hire_rate"] = ""
-                            card["client_country"] = ""
-                            card["num_proposals"] = None
-                            card["category"] = ""
-                            card["search_query"] = search_query
-                            if self.db.insert_upwork_job(run_id, card):
-                                total += 1
-                            continue
-
-                        job_data = self._parse_job_detail(detail_content, card)
-                        job_data["search_query"] = search_query
-
-                        desc_len = len(job_data.get("description", ""))
-                        client = job_data.get("client_country", "") or "?"
+                        job_data = self._parse_job(result, search_query)
+                        title_short = job_data["title"][:55]
                         budget = ""
-                        if job_data.get("budget_min"):
-                            budget = f"${job_data['budget_min']}"
-                            if job_data.get("budget_max"):
-                                budget += f"-${job_data['budget_max']}"
+                        if job_data["budget_min"] is not None:
+                            budget = f"${job_data['budget_min']:.0f}"
+                            if job_data["budget_max"]:
+                                budget += f"-${job_data['budget_max']:.0f}"
 
                         if self.db.insert_upwork_job(run_id, job_data):
                             total += 1
-                            print(f"    + {desc_len} chars | {budget} | {client}")
+                            page_new += 1
+                            skills_str = ", ".join(job_data["skills"][:3])
+                            print(
+                                f"  [{i+1}/{len(results)}] + {title_short}"
+                                f" | {budget or 'no budget'}"
+                                f" | {job_data['experience_level'] or '?'}"
+                                f" | {skills_str}"
+                            )
                         else:
-                            print(f"    = already in DB")
-
+                            print(f"  [{i+1}/{len(results)}] = {title_short} (already in DB)")
                     except Exception as e:
-                        print(f"    ERROR: {e}")
+                        print(f"  [{i+1}/{len(results)}] ERROR: {e}")
 
-                if not cards:
-                    print("  No jobs found on this page.")
+                pages_done = page_num
+
+                if stop_on_dupes and len(results) > 0 and page_new / len(results) < 0.2:
+                    print(f"  >80% duplicates on this page ({page_new}/{len(results)} new), moving on.")
+                    break
+
+                if offset + PAGE_SIZE >= api_total:
+                    print(f"  Reached end of results ({api_total} total).")
                     break
 
                 if page_num < pages:
-                    await self.random_delay()
+                    delay = random.uniform(d_min, d_max)
+                    print(f"  Waiting {delay:.1f}s...")
+                    time.sleep(delay)
 
+        except Exception as e:
+            print(f"\nScraper error: {e}")
+            raise
         finally:
-            await self.stop_browser()
-            self.db.finish_run(run_id, pages, total)
+            self.db.finish_run(run_id, pages_done, total)
 
         return total
+
+    def close(self):
+        if self._session:
+            self._session.close()
+            self._session = None
+
+
+class TokenExpired(Exception):
+    pass
