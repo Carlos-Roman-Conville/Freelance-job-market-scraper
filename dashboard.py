@@ -316,6 +316,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    # Threading matters here: the page auto-refreshes every 15s, so a couple of
+    # open tabs keep a single-threaded server permanently saturated and every
+    # viewer queues behind the others.
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Dashboard running at http://localhost:{PORT}")
     server.serve_forever()
