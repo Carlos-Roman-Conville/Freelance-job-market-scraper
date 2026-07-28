@@ -89,22 +89,19 @@ def export_upwork_excel(jobs, filename=None):
         ("Budget Min", 12),
         ("Budget Max", 12),
         ("Experience", 14),
-        ("Client Rating", 12),
-        ("Client Spent", 14),
-        ("Client Hire Rate", 14),
-        ("Client Country", 16),
-        ("Proposals", 10),
         ("Posted", 16),
-        ("Category", 25),
         ("Search Query", 20),
         ("Scraped At", 20),
     ]
 
+    # client_rating / client_total_spent / client_hire_rate / client_country /
+    # num_proposals / category are deliberately omitted: the anonymous visitor
+    # token the scraper uses is refused those GraphQL fields ("not enough
+    # oauth2 permissions/scopes"), so they are empty for every row and would
+    # ship as blank columns. Re-add them here if the scraper ever authenticates.
     field_keys = [
         "title", "job_url", "skills", "budget_type", "budget_min", "budget_max",
-        "experience_level", "client_rating", "client_total_spent", "client_hire_rate",
-        "client_country", "num_proposals", "posted_date", "category",
-        "search_query", "scraped_at",
+        "experience_level", "posted_date", "search_query", "scraped_at",
     ]
 
     wb = openpyxl.Workbook()
@@ -120,21 +117,23 @@ def export_upwork_excel(jobs, filename=None):
     stats_font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
     val_font = Font(name="Calibri", size=14, bold=True, color="2563EB")
 
-    labels = ["Total Jobs", "Fixed Price", "Hourly", "Avg Budget Min", "Top Category"]
+    labels = ["Total Jobs", "Fixed Price", "Hourly", "Avg Budget Min", "Top Search Query"]
     total = len(jobs)
     fixed = sum(1 for j in jobs if "fixed" in str(j.get("budget_type", "")).lower())
     hourly = sum(1 for j in jobs if "hourly" in str(j.get("budget_type", "")).lower())
     budgets = [j["budget_min"] for j in jobs if j.get("budget_min") is not None]
     avg_budget = f"${sum(budgets) / len(budgets):,.0f}" if budgets else "N/A"
 
-    cats = {}
+    # Was "Top Category", but category is never populated (see field_keys above),
+    # so it always read "N/A". search_query is the populated equivalent.
+    queries = {}
     for j in jobs:
-        c = j.get("category", "")
-        if c:
-            cats[c] = cats.get(c, 0) + 1
-    top_cat = max(cats, key=cats.get) if cats else "N/A"
+        q = j.get("search_query", "")
+        if q:
+            queries[q] = queries.get(q, 0) + 1
+    top_query = max(queries, key=queries.get) if queries else "N/A"
 
-    values = [total, fixed, hourly, avg_budget, top_cat]
+    values = [total, fixed, hourly, avg_budget, top_query]
 
     for col, (label, val) in enumerate(zip(labels, values), 1):
         hcell = ws_stats.cell(row=1, column=col, value=label)

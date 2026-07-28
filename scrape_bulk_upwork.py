@@ -9,10 +9,11 @@ import sys
 import time
 from pathlib import Path
 
-# Redirected stdout falls back to cp1252 on Windows; a single emoji in a
-# scraped title would otherwise kill the whole run with UnicodeEncodeError.
+# Two problems when stdout is redirected to a file on Windows: it falls back to
+# cp1252 (one emoji in a scraped title kills the run), and it block-buffers, so a
+# multi-hour scrape shows no progress until it exits.
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 from config import DATABASE_URL
 from db import JobDatabase
