@@ -9,6 +9,11 @@ import sys
 import time
 from pathlib import Path
 
+# Redirected stdout falls back to cp1252 on Windows; a single emoji in a
+# scraped title would otherwise kill the whole run with UnicodeEncodeError.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from config import DATABASE_URL
 from db import JobDatabase
 from scrapers.upwork import UpworkScraper

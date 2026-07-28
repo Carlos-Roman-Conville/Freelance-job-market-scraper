@@ -4,7 +4,8 @@ import sys
 from pathlib import Path
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -31,57 +32,58 @@ def main():
 
     history = []
 
-    while True:
-        try:
-            question = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
+    try:
+        while True:
+            try:
+                question = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
 
-        if not question:
-            continue
-        if question.lower() in ("quit", "exit", "q"):
-            break
+            if not question:
+                continue
+            if question.lower() in ("quit", "exit", "q"):
+                break
 
-        try:
-            context = rag.build_context(question)
-        except Exception as e:
-            print(f"\nRAG error: {e}\n")
-            continue
+            try:
+                context = rag.build_context(question)
+            except Exception as e:
+                print(f"\nRAG error: {e}\n")
+                continue
 
-        messages = list(history)
-        messages.append({
-            "role": "user",
-            "content": f"[MARKET DATA]\n{context}\n\n[QUESTION]\n{question}",
-        })
+            messages = list(history)
+            messages.append({
+                "role": "user",
+                "content": f"[MARKET DATA]\n{context}\n\n[QUESTION]\n{question}",
+            })
 
-        try:
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=8192,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            )
-            answer = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    answer = block.text
-                    break
-        except Exception as e:
-            print(f"\nAPI error: {e}\n")
-            continue
+            try:
+                response = client.messages.create(
+                    model=CLAUDE_MODEL,
+                    max_tokens=8192,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                )
+                answer = ""
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        answer = block.text
+                        break
+            except Exception as e:
+                print(f"\nAPI error: {e}\n")
+                continue
 
-        if not answer:
-            print("\nAgent: (no response)\n")
-            continue
-        print(f"\nAgent: {answer}\n")
+            if not answer:
+                print("\nAgent: (no response)\n")
+                continue
+            print(f"\nAgent: {answer}\n")
 
-        history.append({"role": "user", "content": question})
-        history.append({"role": "assistant", "content": answer})
-        if len(history) > 20:
-            history = history[-20:]
-
-    rag.close()
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": answer})
+            if len(history) > 20:
+                history = history[-20:]
+    finally:
+        rag.close()
     print("Goodbye!")
 
 

@@ -15,6 +15,11 @@ import argparse
 import asyncio
 import sys
 
+# Redirected stdout falls back to cp1252 on Windows; a single emoji in a
+# scraped title would otherwise kill the whole run with UnicodeEncodeError.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from config import DATABASE_URL, DEFAULT_PAGES
 from db import JobDatabase
 from export import export_upwork_excel, export_fiverr_excel
@@ -32,7 +37,7 @@ def cmd_upwork(args, db):
     print(f"{'=' * 50}")
 
     if args.export:
-        jobs = db.get_upwork_jobs(query=args.search)
+        jobs = db.get_upwork_jobs(query=args.search, limit=None)
         export_upwork_excel(jobs)
 
 
@@ -45,16 +50,16 @@ def cmd_fiverr(args, db):
     print(f"{'=' * 50}")
 
     if args.export:
-        gigs = db.get_fiverr_gigs(query=args.search)
+        gigs = db.get_fiverr_gigs(query=args.search, limit=None)
         export_fiverr_excel(gigs)
 
 
 def cmd_export(args, db):
     if args.platform == "upwork":
-        jobs = db.get_upwork_jobs(query=args.query)
+        jobs = db.get_upwork_jobs(query=args.query, limit=args.limit)
         export_upwork_excel(jobs)
     else:
-        gigs = db.get_fiverr_gigs(query=args.query)
+        gigs = db.get_fiverr_gigs(query=args.query, limit=args.limit)
         export_fiverr_excel(gigs)
 
 
@@ -104,6 +109,8 @@ def main():
     ex = subparsers.add_parser("export", help="Export stored data to Excel")
     ex.add_argument("platform", choices=["upwork", "fiverr"], help="Platform to export")
     ex.add_argument("--query", default=None, help="Filter by search query")
+    ex.add_argument("--limit", type=int, default=None,
+                    help="Max rows to export (default: all)")
 
     # Stats
     subparsers.add_parser("stats", help="Show database statistics")

@@ -6,6 +6,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Redirected stdout falls back to cp1252 on Windows; a single emoji in a
+# scraped title would otherwise kill the whole run with UnicodeEncodeError.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from config import DATABASE_URL
 from db import JobDatabase, _normalize_tag
 from scrapers.fiverr import FiverrScraper
@@ -91,29 +96,37 @@ async def main():
                     for u in updates:
                         col_name = u.split(" = ")[0]
                         assert col_name in ALLOWED_COLS, f"unexpected column: {col_name}"
-                    params.append(gig_id)
-                    db.execute(
-                        "UPDATE fiverr_gigs SET " + ", ".join(updates) + " WHERE id = %s",
-                        params,
-                    )
-                    db.conn.commit()
+
                     new_tags = data.get("tags", [])
-                    if new_tags:
-                        try:
-                            new_canonical = [_normalize_tag(t) for t in new_tags]
-                            new_canonical = [c for c in new_canonical if c is not None]
-                            existing_count = db.execute(
-                                "SELECT COUNT(*) FROM gig_skills WHERE gig_id = %s", (gig_id,)
-                            ).fetchone()[0]
-                            if len(new_canonical) >= existing_count:
-                                db.execute("DELETE FROM gig_skills WHERE gig_id = %s", (gig_id,))
+                    new_canonical = [c for c in (_normalize_tag(t) for t in new_tags)
+                                     if c is not None]
+                    existing_count = db.execute(
+                        "SELECT COUNT(*) FROM gig_skills WHERE gig_id = %s", (gig_id,)
+                    ).fetchone()[0]
+
+                    # A re-scrape yielding fewer skills is likely a partial parse —
+                    # skip the tags column too so it can't diverge from gig_skills.
+                    replace_skills = bool(new_canonical) and len(new_canonical) >= existing_count
+                    if not replace_skills:
+                        keep = [(u, p) for u, p in zip(updates, params)
+                                if not u.startswith("tags ")]
+                        updates = [u for u, _ in keep]
+                        params = [p for _, p in keep]
+
+                    if updates:
+                        params.append(gig_id)
+                        db.execute(
+                            "UPDATE fiverr_gigs SET " + ", ".join(updates) + " WHERE id = %s",
+                            params,
+                        )
+                        if replace_skills:
+                            db.execute("DELETE FROM gig_skills WHERE gig_id = %s", (gig_id,))
                             for canonical in new_canonical:
                                 db._link_skill(gig_id, canonical)
-                            db.conn.commit()
-                        except Exception:
-                            db.conn.rollback()
+                        db.conn.commit()
+
                     desc_len = len(data.get("description", ""))
-                    tag_count = len(new_tags)
+                    tag_count = len(new_canonical) if replace_skills else 0
                     print(f"    FIXED: {desc_len} chars, {tag_count} tags")
                     fixed += 1
                 else:

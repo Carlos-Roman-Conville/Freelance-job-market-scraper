@@ -89,9 +89,12 @@ class UpworkScraper:
         resp = session.get("https://www.upwork.com/", timeout=30)
         resp.raise_for_status()
 
-        token = resp.cookies.get(TOKEN_COOKIE)
+        # resp.cookies only carries this response's Set-Cookie headers; on a
+        # repeat call Upwork won't re-issue a token we already hold, so fall
+        # back to the session jar before giving up.
+        token = resp.cookies.get(TOKEN_COOKIE) or session.cookies.get(TOKEN_COOKIE)
         if not token:
-            available = list(resp.cookies.keys())
+            available = sorted(set(resp.cookies.keys()) | set(session.cookies.keys()))
             raise RuntimeError(
                 f"No {TOKEN_COOKIE} cookie found. Available: {available}"
             )
@@ -122,12 +125,26 @@ class UpworkScraper:
         }
 
         session = self._get_session()
-        resp = session.post(
-            GRAPHQL_URL,
-            json={"query": JOB_SEARCH_QUERY, "variables": variables},
-            headers=self._graphql_headers(),
-            timeout=30,
-        )
+        for attempt in range(3):
+            resp = session.post(
+                GRAPHQL_URL,
+                json={"query": JOB_SEARCH_QUERY, "variables": variables},
+                headers=self._graphql_headers(),
+                timeout=30,
+            )
+            if resp.status_code != 429:
+                break
+            # Back off in place — abandoning the query here would drop every
+            # remaining page of it, since the bulk runner never revisits.
+            backoff = 30 * (attempt + 1)
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    backoff = max(backoff, int(retry_after))
+                except ValueError:
+                    pass
+            print(f"  Rate limited (429), waiting {backoff}s (attempt {attempt + 1}/3)...")
+            time.sleep(backoff)
 
         if resp.status_code == 401:
             raise TokenExpired("Token expired, need to refresh")
@@ -147,8 +164,8 @@ class UpworkScraper:
             .get("visitorJobSearchV1") or {}
         )
 
-        paging = search_result.get("paging", {})
-        results = search_result.get("results", [])
+        paging = search_result.get("paging") or {}
+        results = search_result.get("results") or []
 
         return paging, results
 
@@ -248,7 +265,7 @@ class UpworkScraper:
                     self._fetch_token()
                     paging, results = self._search_page(search_query, offset)
 
-                api_total = paging.get("total", 0)
+                api_total = paging.get("total") or 0
                 print(f"  Got {len(results)} results (API reports {api_total} total)")
 
                 if not results:
@@ -256,6 +273,7 @@ class UpworkScraper:
                     break
 
                 page_new = 0
+                page_errors = 0
                 for i, result in enumerate(results):
                     try:
                         job_data = self._parse_job(result, search_query)
@@ -279,11 +297,16 @@ class UpworkScraper:
                         else:
                             print(f"  [{i+1}/{len(results)}] = {title_short} (already in DB)")
                     except Exception as e:
+                        page_errors += 1
                         print(f"  [{i+1}/{len(results)}] ERROR: {e}")
 
                 pages_done = page_num
 
-                if stop_on_dupes and len(results) > 0 and page_new / len(results) < 0.2:
+                # Only a page that actually processed cleanly tells us anything
+                # about duplicate density — errors are not duplicates.
+                if page_errors:
+                    print(f"  {page_errors} insert error(s) on this page; not treating as duplicates.")
+                elif stop_on_dupes and len(results) > 0 and page_new / len(results) < 0.2:
                     print(f"  >80% duplicates on this page ({page_new}/{len(results)} new), moving on.")
                     break
 

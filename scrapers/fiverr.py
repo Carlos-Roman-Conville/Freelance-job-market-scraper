@@ -58,7 +58,7 @@ class FiverrScraper(BaseScraper):
             price_min = None
 
             for i, text in enumerate(text_blocks):
-                text = text.replace("&nbsp;", " ").replace("&amp;", "&").strip()
+                text = html_mod.unescape(text).strip()
                 if not text:
                     continue
 
@@ -289,6 +289,7 @@ class FiverrScraper(BaseScraper):
             )
             if not tag_texts:
                 tag_texts = re.findall(r'>([^<]{3,50})<', skills_section.group(1))
+            tag_texts = [html_mod.unescape(t) for t in tag_texts]
             tags = [t.strip() for t in tag_texts
                     if 2 < len(t.strip()) < 50
                     and not re.match(r'^\+\d+$', t.strip())
@@ -303,6 +304,7 @@ class FiverrScraper(BaseScraper):
             )
             if related_section:
                 tag_texts = re.findall(r'<a[^>]*>([^<]+)</a>', related_section.group(1))
+                tag_texts = [html_mod.unescape(t) for t in tag_texts]
                 tags = [t.strip() for t in tag_texts
                         if 2 < len(t.strip()) < 50
                         and t.strip().lower() not in noise]
@@ -316,6 +318,7 @@ class FiverrScraper(BaseScraper):
             )
             if skills_html:
                 tag_texts = re.findall(r'>([^<]{3,50})<', skills_html.group(1))
+                tag_texts = [html_mod.unescape(t) for t in tag_texts]
                 tags = [t.strip() for t in tag_texts
                         if 2 < len(t.strip()) < 50
                         and not re.match(r'^\+\d+$', t.strip())

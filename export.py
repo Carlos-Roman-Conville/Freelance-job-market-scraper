@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 
 import openpyxl
@@ -6,6 +7,9 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from config import OUTPUT_DIR
+
+# Control characters openpyxl refuses to write (raises IllegalCharacterError).
+_ILLEGAL_XLSX_CHARS = re.compile(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]')
 
 
 def _style_header(ws, columns):
@@ -39,12 +43,17 @@ def _write_rows(ws, rows, field_keys, link_columns=None):
             elif value is None:
                 value = ""
 
-            if isinstance(value, str) and value and value[0] in ('=', '+', '-', '@', '\t', '\r'):
-                value = "'" + value
-            if isinstance(value, str) and value == "":
-                cell = ws.cell(row=row_idx, column=col_idx, value="")
-            else:
-                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            needs_quote_prefix = False
+            if isinstance(value, str) and value:
+                # openpyxl rejects these outright, so strip before writing.
+                value = _ILLEGAL_XLSX_CHARS.sub("", value)
+                needs_quote_prefix = value[:1] in ('=', '+', '-', '@')
+
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            if needs_quote_prefix:
+                # Set the style flag rather than prepending "'" — prepending
+                # stores the apostrophe as part of the value and Excel shows it.
+                cell.quotePrefix = True
             cell.font = data_font
             cell.border = thin_border
             if bg:

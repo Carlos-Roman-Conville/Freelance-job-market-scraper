@@ -1,3 +1,4 @@
+import html
 import json
 import re
 
@@ -233,7 +234,7 @@ def _normalize_tag(tag):
     """Return canonical display name, or None if noise."""
     if not isinstance(tag, str):
         return None
-    tag = tag.strip()
+    tag = re.sub(r'\s+', ' ', html.unescape(tag)).strip()
     if _is_noise_tag(tag):
         return None
     low = tag.lower()
@@ -242,14 +243,41 @@ def _normalize_tag(tag):
     return tag
 
 
+# Bump when _create_tables() changes so existing deployments re-run the DDL.
+SCHEMA_VERSION = 1
+
+
 class JobDatabase:
     def __init__(self, dsn):
         self.conn = psycopg2.connect(dsn, cursor_factory=psycopg2.extras.DictCursor)
         try:
-            self._create_tables()
+            if self._needs_schema_setup():
+                self._create_tables()
         except Exception:
             self.conn.close()
             raise
+
+    def _needs_schema_setup(self):
+        """True if the schema is missing or stale.
+
+        _create_tables() takes ACCESS EXCLUSIVE locks (DROP/CREATE TRIGGER), so
+        running it on every construction stalls any scraper already inserting.
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS schema_meta (
+                        id      INTEGER PRIMARY KEY CHECK (id = 1),
+                        version INTEGER NOT NULL
+                    )
+                """)
+                cur.execute("SELECT version FROM schema_meta WHERE id = 1")
+                row = cur.fetchone()
+            self.conn.commit()
+            return row is None or row[0] != SCHEMA_VERSION
+        except Exception:
+            self.conn.rollback()
+            return True
 
     def execute(self, query, params=None):
         """Execute a query and return the cursor (for external callers)."""
@@ -442,6 +470,12 @@ class JobDatabase:
                 ORDER BY avg_price DESC, pct_new_sellers DESC
             """)
 
+            cur.execute(
+                """INSERT INTO schema_meta (id, version) VALUES (1, %s)
+                   ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version""",
+                (SCHEMA_VERSION,),
+            )
+
         self.conn.commit()
         self._populate_skills()
 
@@ -464,11 +498,16 @@ class JobDatabase:
                 continue
             if not isinstance(tags, list):
                 continue
+            linked_any = False
             for tag in tags:
                 canonical = _normalize_tag(tag)
                 if canonical is None:
                     continue
                 self._link_skill(row["id"], canonical)
+                linked_any = True
+            if not linked_any:
+                with self.conn.cursor() as cur:
+                    cur.execute("UPDATE fiverr_gigs SET tags = '[]' WHERE id = %s", (row["id"],))
         self.conn.commit()
 
     def _get_or_create_skill(self, display_name):
@@ -547,8 +586,13 @@ class JobDatabase:
             self.conn.commit()
             return inserted
         except Exception:
-            self.conn.rollback()
-            return False
+            # Re-raise: returning False here would be indistinguishable from a
+            # duplicate, and callers use that ratio to decide when to stop.
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def insert_fiverr_gig(self, run_id, data):
         try:
@@ -601,8 +645,11 @@ class JobDatabase:
             self.conn.commit()
             return True
         except Exception:
-            self.conn.rollback()
-            return False
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def get_upwork_jobs(self, query=None, limit=500):
         with self.conn.cursor() as cur:

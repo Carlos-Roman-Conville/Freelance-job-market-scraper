@@ -93,27 +93,31 @@ def chat():
             system=SYSTEM_PROMPT,
             messages=messages,
         )
-        answer = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                answer = block.text
-                break
+        answer = "".join(
+            block.text for block in response.content if hasattr(block, "text")
+        )
         if not answer:
             return jsonify({"error": "No text in response"}), 500
+        truncated = response.stop_reason == "max_tokens"
+        if truncated:
+            answer += "\n\n_[Response was cut off at the length limit.]_"
     except Exception as e:
         logging.exception("Chat API error for session %s", session_id)
         return jsonify({"error": "Failed to generate response. Please try again."}), 500
 
-    with conv_lock:
-        if session_id not in conversations:
-            conversations[session_id] = []
-        conversations[session_id].append({"role": "user", "content": message})
-        conversations[session_id].append({"role": "assistant", "content": answer})
-        if len(conversations[session_id]) > 20:
-            conversations[session_id] = conversations[session_id][-20:]
-        conversation_times[session_id] = time.time()
+    # A truncated answer is not a valid turn — storing it would make every
+    # later turn build on a sentence that stops mid-thought.
+    if not truncated:
+        with conv_lock:
+            if session_id not in conversations:
+                conversations[session_id] = []
+            conversations[session_id].append({"role": "user", "content": message})
+            conversations[session_id].append({"role": "assistant", "content": answer})
+            if len(conversations[session_id]) > 20:
+                conversations[session_id] = conversations[session_id][-20:]
+            conversation_times[session_id] = time.time()
 
-    return jsonify({"response": answer})
+    return jsonify({"response": answer, "truncated": truncated})
 
 
 @app.route("/api/stats", methods=["GET"])
@@ -127,7 +131,7 @@ def stats():
         cur.execute("SELECT AVG(price_min) FROM fiverr_gigs")
         avg_price = cur.fetchone()[0] or 0
         cur.execute(
-            "SELECT skill, gig_count, avg_price FROM beginner_opportunities ORDER BY avg_price DESC LIMIT 5"
+            "SELECT skill, gig_count, avg_price FROM beginner_opportunities ORDER BY avg_price DESC NULLS LAST LIMIT 5"
         )
         top = cur.fetchall()
         cur.execute("SELECT COUNT(*) FROM upwork_jobs")

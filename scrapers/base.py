@@ -32,11 +32,23 @@ class BaseScraper:
             profile = SCRAPER_PROFILE
             profile.mkdir(parents=True, exist_ok=True)
 
-        self.browser = await uc.start(
-            headless=self.headless,
-            user_data_dir=str(profile),
-            sandbox=False,
-        )
+        try:
+            self.browser = await uc.start(
+                headless=self.headless,
+                user_data_dir=str(profile),
+                sandbox=False,
+            )
+        except Exception as e:
+            # Chrome's SingletonLock makes the second process fail with an
+            # opaque connect error; say what actually went wrong.
+            if (profile / "SingletonLock").exists() or "connect" in str(e).lower():
+                raise RuntimeError(
+                    f"Could not start Chrome with profile {profile}.\n"
+                    "Another scraper is most likely already running against it "
+                    "(only one process may use a profile at a time).\n"
+                    "Close the other scraper, or pass use_chrome/a separate profile."
+                ) from e
+            raise
 
     async def stop_browser(self):
         if self.browser:
@@ -72,11 +84,10 @@ class BaseScraper:
         return False
 
     async def navigate(self, url, wait=8, max_retries=4):
-        if self.page is not None:
-            try:
-                await self.page.close()
-            except Exception:
-                pass
+        # Do NOT close self.page first. Tab.close() doesn't refresh
+        # Browser._targets, so the next get() picks the dead target and raises
+        # "Session with given id not found". get(new_tab=False) reuses the same
+        # target anyway, so there is no tab to leak.
         self.page = await self.browser.get(url)
         await self.page.sleep(wait)
         content = await self.page.get_content()

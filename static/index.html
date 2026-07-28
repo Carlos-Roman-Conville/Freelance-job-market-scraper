@@ -343,10 +343,13 @@ async function sendMessage(e) {
   chatContainer.scrollTop = chatContainer.scrollHeight;
 
   try {
+    // Without a deadline a stalled request leaves the input disabled with no
+    // way back — the browser applies no default fetch timeout.
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: msg, session_id: sessionId }),
+      signal: AbortSignal.timeout(120000),
     });
     let data;
     try {
@@ -360,7 +363,9 @@ async function sendMessage(e) {
       addMessage(data.response, 'agent');
     }
   } catch (err) {
-    addMessage('Connection error: ' + err.message, 'agent');
+    addMessage(err.name === 'TimeoutError'
+      ? 'Request timed out after 2 minutes. Please try again.'
+      : 'Connection error: ' + err.message, 'agent');
   }
 
   typing.classList.remove('active');
@@ -384,6 +389,10 @@ function escapeHtml(text) {
 }
 
 function renderMarkdown(text) {
+  // Strip NULs so the placeholder sentinels below cannot be forged by an
+  // answer that happens to contain the placeholder text literally.
+  text = text.replace(/\u0000/g, '');
+
   // Escape HTML entities first to prevent XSS
   text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -391,14 +400,14 @@ function renderMarkdown(text) {
   const codeBlocks = [];
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
     codeBlocks.push('<pre><code>' + code + '</code></pre>');
-    return '\n\n{{CODE_BLOCK_' + (codeBlocks.length - 1) + '}}\n\n';
+    return '\n\n\u0000C' + (codeBlocks.length - 1) + '\u0000\n\n';
   });
 
   // Inline code — extract to placeholders to protect from bold/italic
   const inlineCode = [];
   text = text.replace(/`([^`]+)`/g, (_, code) => {
     inlineCode.push('<code>' + code + '</code>');
-    return '{{INLINE_CODE_' + (inlineCode.length - 1) + '}}';
+    return '\u0000I' + (inlineCode.length - 1) + '\u0000';
   });
 
   // Tables
@@ -429,7 +438,7 @@ function renderMarkdown(text) {
   text = text.replace(/(?<!\w)\*(.+?)\*(?!\w)/g, '<em>$1</em>');
 
   // Restore inline code from placeholders
-  text = text.replace(/\{\{INLINE_CODE_(\d+)\}\}/g, (_, i) => inlineCode[parseInt(i)]);
+  text = text.replace(/\u0000I(\d+)\u0000/g, (m, i) => inlineCode[parseInt(i)] ?? m);
 
   // Links (only allow http/https URLs, sanitize href to prevent attribute injection)
   text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)"]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
@@ -448,7 +457,7 @@ function renderMarkdown(text) {
   text = text.replace(/<p>\s*<\/p>/g, '');
 
   // Restore code blocks from placeholders, then clean <p> wrapping around <pre>
-  text = text.replace(/\{\{CODE_BLOCK_(\d+)\}\}/g, (_, i) => codeBlocks[parseInt(i)]);
+  text = text.replace(/\u0000C(\d+)\u0000/g, (m, i) => codeBlocks[parseInt(i)] ?? m);
   text = text.replace(/<p>\s*(<pre>)/g, '$1');
   text = text.replace(/(<\/pre>)\s*<\/p>/g, '$1');
 
