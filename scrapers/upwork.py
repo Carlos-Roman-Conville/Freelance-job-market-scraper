@@ -220,6 +220,11 @@ class UpworkScraper:
         # Posted date
         posted_date = job.get("publishTime", "")
 
+        # Client details (rating, spend, hire rate, country), proposal counts and
+        # category are deliberately absent: Upwork's GraphQL refuses those fields
+        # to the anonymous visitor token this scraper uses ("not enough oauth2
+        # permissions/scopes"), so they were stored empty on every row and the
+        # columns have been dropped. Re-add here and in db.py if auth is added.
         return {
             "job_url": job_url,
             "title": title,
@@ -229,13 +234,7 @@ class UpworkScraper:
             "budget_min": budget_min,
             "budget_max": budget_max,
             "experience_level": experience_level,
-            "client_rating": None,
-            "client_total_spent": "",
-            "client_hire_rate": "",
-            "client_country": "",
-            "num_proposals": None,
             "posted_date": posted_date,
-            "category": "",
             "search_query": search_query,
         }
 

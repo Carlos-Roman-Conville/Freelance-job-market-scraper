@@ -244,7 +244,9 @@ def _normalize_tag(tag):
 
 
 # Bump when _create_tables() changes so existing deployments re-run the DDL.
-SCHEMA_VERSION = 1
+# v2: dropped the six always-empty upwork_jobs columns (client_*, num_proposals,
+#     category) and the category term from the search_vector trigger.
+SCHEMA_VERSION = 2
 
 
 class JobDatabase:
@@ -310,13 +312,7 @@ class JobDatabase:
                     budget_min      DOUBLE PRECISION,
                     budget_max      DOUBLE PRECISION,
                     experience_level TEXT,
-                    client_rating   DOUBLE PRECISION,
-                    client_total_spent TEXT,
-                    client_hire_rate   TEXT,
-                    client_country  TEXT,
-                    num_proposals   INTEGER,
                     posted_date     TEXT,
-                    category        TEXT,
                     scraped_at      TEXT NOT NULL,
                     search_query    TEXT,
                     search_vector   TSVECTOR
@@ -367,7 +363,6 @@ class JobDatabase:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_gig_skills_skill ON gig_skills(skill_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_upwork_scraped_at ON upwork_jobs(scraped_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_upwork_search ON upwork_jobs(search_query)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_upwork_category ON upwork_jobs(category)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_upwork_experience ON upwork_jobs(experience_level)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_fiverr_scraped_at ON fiverr_gigs(scraped_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_fiverr_search ON fiverr_gigs(search_query)")
@@ -380,7 +375,6 @@ class JobDatabase:
                     NEW.search_vector :=
                         setweight(to_tsvector('english', COALESCE(NEW.title, '')), 'A') ||
                         setweight(to_tsvector('english', COALESCE(NEW.skills, '')), 'B') ||
-                        setweight(to_tsvector('english', COALESCE(NEW.category, '')), 'B') ||
                         setweight(to_tsvector('english', COALESCE(NEW.description, '')), 'C');
                     RETURN NEW;
                 END;
@@ -556,10 +550,8 @@ class JobDatabase:
                     """INSERT INTO upwork_jobs
                        (scrape_run_id, job_url, title, description, skills,
                         budget_type, budget_min, budget_max, experience_level,
-                        client_rating, client_total_spent, client_hire_rate,
-                        client_country, num_proposals, posted_date, category,
-                        scraped_at, search_query)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        posted_date, scraped_at, search_query)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT (job_url) DO NOTHING""",
                     (
                         run_id,
@@ -571,13 +563,7 @@ class JobDatabase:
                         data.get("budget_min"),
                         data.get("budget_max"),
                         data.get("experience_level", ""),
-                        data.get("client_rating"),
-                        data.get("client_total_spent", ""),
-                        data.get("client_hire_rate", ""),
-                        data.get("client_country", ""),
-                        data.get("num_proposals"),
                         data.get("posted_date", ""),
-                        data.get("category", ""),
                         self._now(),
                         data.get("search_query", ""),
                     ),
