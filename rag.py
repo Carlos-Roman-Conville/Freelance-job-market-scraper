@@ -7,16 +7,33 @@ import chromadb
 
 from config import DATABASE_URL, CHROMA_DIR
 
+_LEGACY_COLLECTION = "gigs"
+
+
+def _collection_name(dsn):
+    """Namespace the vector collection by database.
+
+    The index is derived from one specific database, but CHROMA_DIR is a fixed
+    path. Sharing a single "gigs" collection meant pointing DATABASE_URL at a
+    different database (staging, a fresh one, a re-run migration) made the
+    count mismatch and silently deleted a fully-built index.
+    """
+    db_name = dsn.rsplit("/", 1)[-1].split("?")[0] or "default"
+    safe = re.sub(r"[^0-9A-Za-z_-]", "_", db_name)
+    return f"gigs_{safe}"
+
 
 class RAGEngine:
     def __init__(self):
         self.db = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
         self.db.autocommit = True
         self.chroma = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        self.collection_name = _collection_name(DATABASE_URL)
 
         # ChromaDB for Fiverr semantic search (small dataset, ~2.5K docs)
+        self._adopt_legacy_collection()
         self.fiverr_collection = self.chroma.get_or_create_collection(
-            name="gigs",
+            name=self.collection_name,
             metadata={"hnsw:space": "cosine"},
         )
         try:
@@ -29,12 +46,27 @@ class RAGEngine:
             print("Warning: Database not initialized. Run the scraper first.")
             db_count = None
         if db_count is not None and self.fiverr_collection.count() != db_count:
-            self.chroma.delete_collection("gigs")
+            self.chroma.delete_collection(self.collection_name)
             self.fiverr_collection = self.chroma.get_or_create_collection(
-                name="gigs",
+                name=self.collection_name,
                 metadata={"hnsw:space": "cosine"},
             )
             self._index_fiverr()
+
+    def _adopt_legacy_collection(self):
+        """Rename a pre-namespacing "gigs" collection instead of rebuilding it."""
+        try:
+            existing = {c.name for c in self.chroma.list_collections()}
+        except Exception:
+            return
+        if _LEGACY_COLLECTION in existing and self.collection_name not in existing:
+            try:
+                self.chroma.get_collection(_LEGACY_COLLECTION).modify(
+                    name=self.collection_name
+                )
+                print(f"  Adopted existing vector index as '{self.collection_name}'")
+            except Exception:
+                pass
 
         # Upwork uses PostgreSQL full-text search (tsvector + GIN index)
 
