@@ -10,6 +10,21 @@ from config import DATABASE_URL, CHROMA_DIR
 _LEGACY_COLLECTION = "gigs"
 
 
+def _confidence(n):
+    """Label a stat by how much evidence sits behind it.
+
+    A '% new sellers' figure from 5 gigs moves 20 points if one gig differs;
+    from 144 gigs it moves under 1. Without this the two print identically.
+    """
+    if n is None:
+        return ""
+    if n < 5:
+        return " [VERY LOW CONFIDENCE - tiny sample]"
+    if n < 15:
+        return " [LOW CONFIDENCE - small sample]"
+    return ""
+
+
 def _collection_name(dsn):
     """Namespace the vector collection by database.
 
@@ -165,7 +180,7 @@ class RAGEngine:
     def get_skill_stats(self, min_gigs=3):
         cur = self.db.cursor()
         cur.execute(
-            "SELECT * FROM skill_market_stats WHERE gig_count >= %s ORDER BY avg_price_min DESC",
+            "SELECT * FROM skill_market_stats WHERE gig_count >= %s ORDER BY weighted_price DESC",
             (min_gigs,),
         )
         return [dict(r) for r in cur.fetchall()]
@@ -176,11 +191,13 @@ class RAGEngine:
         return [dict(r) for r in cur.fetchall()]
 
     def get_high_value_skills(self, min_gigs=3, min_price=50):
+        # Filter on the raw average (what the skill actually charges) but rank on
+        # the shrunk one, so a 3-gig outlier can qualify without leading the list.
         cur = self.db.cursor()
         cur.execute(
             """SELECT * FROM skill_market_stats
                WHERE gig_count >= %s AND avg_price_min >= %s
-               ORDER BY avg_price_min DESC""",
+               ORDER BY weighted_price DESC""",
             (min_gigs, min_price),
         )
         return [dict(r) for r in cur.fetchall()]
@@ -291,17 +308,20 @@ class RAGEngine:
             high = self.get_high_value_skills(min_gigs=3, min_price=50)[:20]
             if high:
                 lines = [
-                    f"  - {s['skill']}: {s['gig_count']} gigs, avg ${s['avg_price_min']:.0f}, "
+                    f"  - {s['skill']}: {s['gig_count']} gigs{_confidence(s['gig_count'])}, "
+                    f"avg ${s['avg_price_min']:.0f}, "
                     f"{s['pct_new_sellers']:.0f}% new sellers, avg rating "
                     + (f"{s['avg_rating']:.1f}" if s['avg_rating'] is not None else "N/A")
                     for s in high
                 ]
-                parts.append("SUPPLY: HIGH-VALUE SKILLS on Fiverr (avg >= $50, 3+ gigs):\n" + "\n".join(lines))
+                parts.append(
+                    "SUPPLY: HIGH-VALUE SKILLS on Fiverr (avg >= $50, 3+ gigs, "
+                    "ranked by sample-weighted price):\n" + "\n".join(lines))
 
             beginner = self.get_beginner_opportunities()[:20]
             if beginner:
                 lines = [
-                    f"  - {s['skill']}: {s['gig_count']} gigs, avg "
+                    f"  - {s['skill']}: {s['gig_count']} gigs{_confidence(s['gig_count'])}, avg "
                     + (f"${s['avg_price']:.0f}" if s['avg_price'] is not None else "N/A")
                     + f", {s['pct_new_sellers']:.0f}% new sellers, entry "
                     + (f"${s['entry_price']:.0f}" if s['entry_price'] is not None else "N/A")

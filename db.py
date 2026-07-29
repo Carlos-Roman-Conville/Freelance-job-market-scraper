@@ -220,6 +220,14 @@ def _is_noise_tag(tag):
         return True
     if re.match(r'^[a-z]+ \d{4}', low):
         return True
+    # Generic nouns and buzzwords that rank as "skills" but aren't learnable
+    # ones — these were surfacing at the top of the high-value list off 3-4 gigs.
+    if low in ("desktop", "luxury", "software", "custom software",
+               "ecommerce", "e commerce", "typography", "mern", "mern stack",
+               "ai engineer", "shopify app", "modern", "premium quality",
+               "professional", "responsive", "custom", "enterprise",
+               "startup", "small business", "corporate"):
+        return True
     if low in ("database programming", "database management",
                "database design", "database optimization",
                "centralized database", "distributed database",
@@ -246,7 +254,14 @@ def _normalize_tag(tag):
 # Bump when _create_tables() changes so existing deployments re-run the DDL.
 # v2: dropped the six always-empty upwork_jobs columns (client_*, num_proposals,
 #     category) and the category term from the search_vector trigger.
-SCHEMA_VERSION = 2
+# v3: skill_market_stats gained weighted_price / weighted_pct_new.
+SCHEMA_VERSION = 3
+
+# Gig-equivalents of prior belief blended into every per-skill average. A skill
+# needs roughly this many gigs before its own numbers outweigh the market mean.
+# Set from the data: 86% of skills have <5 gigs, so a smaller value would leave
+# the thin tail dominating the rankings.
+SHRINKAGE_PRIOR = 10
 
 
 class JobDatabase:
@@ -409,35 +424,70 @@ class JobDatabase:
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_fiverr_search_vector ON fiverr_gigs USING GIN(search_vector)")
 
-            # Analytics view: per-skill market stats
-            cur.execute("""
-                CREATE OR REPLACE VIEW skill_market_stats AS
+            # Analytics view: per-skill market stats.
+            #
+            # weighted_price / weighted_pct_new are shrinkage estimates: each
+            # skill's own average is blended with the market-wide average in
+            # proportion to how much evidence it has (see SHRINKAGE_PRIOR).
+            # A 3-gig skill whose single outlier gig averages $2,513 gets pulled
+            # most of the way back to the market mean; a 21-gig skill barely
+            # moves. Ranking on the raw average did the opposite — it floated
+            # the thinnest samples to the top, because one expensive gig moves a
+            # 3-gig mean far more than a 30-gig one.
+            # Dropped rather than replaced: CREATE OR REPLACE VIEW can only
+            # append columns, and weighted_* sit before `categories`.
+            cur.execute("DROP VIEW IF EXISTS skill_market_stats")
+            cur.execute(f"""
+                CREATE VIEW skill_market_stats AS
+                WITH prior AS (
+                    SELECT
+                        AVG(price_min)::numeric AS mean_price,
+                        (CAST(SUM(CASE WHEN seller_level LIKE 'Level 1%%' OR seller_level LIKE 'New%%'
+                                       THEN 1 ELSE 0 END) AS DOUBLE PRECISION)
+                         / GREATEST(COUNT(*), 1) * 100)::numeric AS mean_pct_new
+                    FROM fiverr_gigs
+                ),
+                per_skill AS (
+                    SELECT
+                        s.id                                        AS skill_id,
+                        s.display_name                              AS skill,
+                        COUNT(DISTINCT gs.gig_id)                   AS gig_count,
+                        AVG(g.price_min)::numeric                   AS raw_price,
+                        ROUND(AVG(g.price_min)::numeric, 2)         AS avg_price_min,
+                        ROUND(AVG(g.price_max)::numeric, 2)         AS avg_price_max,
+                        ROUND(MIN(g.price_min)::numeric, 2)         AS floor_price,
+                        ROUND(MAX(g.price_max)::numeric, 2)         AS ceiling_price,
+                        ROUND(AVG(g.hourly_rate)::numeric, 2)       AS avg_hourly,
+                        ROUND(AVG(g.rating)::numeric, 2)            AS avg_rating,
+                        ROUND(AVG(g.num_reviews)::numeric, 0)       AS avg_reviews,
+                        SUM(CASE WHEN g.seller_level LIKE 'Level 1%%' OR g.seller_level LIKE 'New%%'
+                                 THEN 1 ELSE 0 END)                 AS new_sellers,
+                        SUM(CASE WHEN g.seller_level LIKE 'Level 2%%' OR g.seller_level LIKE 'Top%%'
+                                 THEN 1 ELSE 0 END)                 AS veteran_sellers,
+                        (CAST(SUM(CASE WHEN g.seller_level LIKE 'Level 1%%' OR g.seller_level LIKE 'New%%'
+                                       THEN 1 ELSE 0 END) AS DOUBLE PRECISION)
+                         / GREATEST(COUNT(DISTINCT gs.gig_id), 1) * 100)::numeric AS raw_pct_new,
+                        STRING_AGG(DISTINCT g.category, ',')        AS categories
+                    FROM skills s
+                    JOIN gig_skills gs ON gs.skill_id = s.id
+                    JOIN fiverr_gigs g ON g.id = gs.gig_id
+                    GROUP BY s.id, s.display_name
+                )
                 SELECT
-                    s.id                                        AS skill_id,
-                    s.display_name                              AS skill,
-                    COUNT(DISTINCT gs.gig_id)                   AS gig_count,
-                    ROUND(AVG(g.price_min)::numeric, 2)         AS avg_price_min,
-                    ROUND(AVG(g.price_max)::numeric, 2)         AS avg_price_max,
-                    ROUND(MIN(g.price_min)::numeric, 2)         AS floor_price,
-                    ROUND(MAX(g.price_max)::numeric, 2)         AS ceiling_price,
-                    ROUND(AVG(g.hourly_rate)::numeric, 2)       AS avg_hourly,
-                    ROUND(AVG(g.rating)::numeric, 2)            AS avg_rating,
-                    ROUND(AVG(g.num_reviews)::numeric, 0)       AS avg_reviews,
-                    SUM(CASE WHEN g.seller_level LIKE 'Level 1%%' OR g.seller_level LIKE 'New%%'
-                             THEN 1 ELSE 0 END)                 AS new_sellers,
-                    SUM(CASE WHEN g.seller_level LIKE 'Level 2%%' OR g.seller_level LIKE 'Top%%'
-                             THEN 1 ELSE 0 END)                 AS veteran_sellers,
-                    ROUND((
-                        CAST(SUM(CASE WHEN g.seller_level LIKE 'Level 1%%' OR g.seller_level LIKE 'New%%'
-                                      THEN 1 ELSE 0 END) AS DOUBLE PRECISION)
-                        / GREATEST(COUNT(DISTINCT gs.gig_id), 1) * 100
-                    )::numeric, 1)                              AS pct_new_sellers,
-                    STRING_AGG(DISTINCT g.category, ',')        AS categories
-                FROM skills s
-                JOIN gig_skills gs ON gs.skill_id = s.id
-                JOIN fiverr_gigs g ON g.id = gs.gig_id
-                GROUP BY s.id, s.display_name
-                ORDER BY gig_count DESC
+                    p.skill_id, p.skill, p.gig_count,
+                    p.avg_price_min, p.avg_price_max, p.floor_price, p.ceiling_price,
+                    p.avg_hourly, p.avg_rating, p.avg_reviews,
+                    p.new_sellers, p.veteran_sellers,
+                    ROUND(p.raw_pct_new, 1)                         AS pct_new_sellers,
+                    ROUND((p.gig_count * COALESCE(p.raw_price, pr.mean_price)
+                           + {SHRINKAGE_PRIOR} * pr.mean_price)
+                          / (p.gig_count + {SHRINKAGE_PRIOR}), 2)   AS weighted_price,
+                    ROUND((p.gig_count * p.raw_pct_new
+                           + {SHRINKAGE_PRIOR} * pr.mean_pct_new)
+                          / (p.gig_count + {SHRINKAGE_PRIOR}), 1)   AS weighted_pct_new,
+                    p.categories
+                FROM per_skill p CROSS JOIN prior pr
+                ORDER BY p.gig_count DESC
             """)
 
             # View: beginner-friendly opportunities (subquery to avoid HAVING alias issue)
