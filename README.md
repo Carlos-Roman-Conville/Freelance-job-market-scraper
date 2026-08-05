@@ -8,7 +8,7 @@ A data pipeline that scrapes 1000+ freelance gigs from Fiverr, normalizes the da
 - "What niches are oversaturated and low-paying?"
 - "What projects should I build to get my first client?"
 
-The agent responds with specific numbers — gig counts, average prices, competition levels, entry prices — not generic advice.
+The agent responds with specific numbers: gig counts, average prices, competition levels, entry prices. Not generic advice.
 
 ## Architecture
 
